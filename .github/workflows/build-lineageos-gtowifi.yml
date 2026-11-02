@@ -1,0 +1,235 @@
+name: Build LineageOS 24 - Galaxy Tab A 8.0 (gtowifi)
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: 'Build variant'
+        required: true
+        default: 'userdebug'
+        type: choice
+        options:
+          - userdebug
+          - eng
+      clean_build:
+        description: 'Clean build (make clobber)'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  build:
+    name: Build LineageOS 24.0 for gtowifi
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    env:
+      BUILD_TYPE: ${{ github.event.inputs.build_type }}
+      CLEAN_BUILD: ${{ github.event.inputs.clean_build }}
+      DEVICE: gtowifi
+      LINEAGE_VERSION: 24.0
+
+    steps:
+      - name: Check initial disk space
+        run: |
+          echo "=== Initial disk usage ==="
+          df -h /
+          echo "=== Top 20 largest directories ==="
+          sudo du -h / --max-depth=2 2>/dev/null | sort -hr | head -20
+
+      - name: Raw disk cleanup (BEFORE apt, no LVM)
+        run: |
+          set -euo pipefail
+          echo "=== Raw disk cleanup (before apt) ==="
+          # 1. Remove BIGGEST space hogs FIRST (no apt needed)
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo rm -rf /opt/hostedtoolcache/go
+          sudo rm -rf /opt/hostedtoolcache/node
+          sudo rm -rf /opt/hostedtoolcache/python
+          sudo rm -rf /var/lib/docker
+          sudo rm -rf /var/lib/snapd
+          
+          # 2. Clean Docker (if daemon runs)
+          sudo docker system prune -af --volumes 2>/dev/null || true
+          
+          # 3. Remove disabled snaps
+          sudo snap list --all 2>/dev/null | awk '/disabled/{print $1" --revision "$3}' | while read snapname revision; do
+            sudo snap remove "$snapname" $revision 2>/dev/null || true
+          done
+          
+          # 4. NOW clear apt cache (apt not needed for this)
+          sudo rm -rf /var/lib/apt/lists/*
+          sudo rm -rf /var/cache/apt/archives/*
+          
+          df -h /
+
+      - name: Aggressive apt cleanup (now with space)
+        run: |
+          set -euo pipefail
+          echo "=== Aggressive apt cleanup ==="
+          # 5. Now apt has room to work
+          sudo apt-get clean
+          sudo apt-get purge -y '^azure-cli' '^google-cloud-sdk' '^mysql' '^postgresql' '^mongodb' '^redis' '^elasticsearch' '^kafka' '^neo4j' 2>/dev/null || true
+          sudo apt-get purge -y '^llvm' '^clang' '^cmake' '^ninja' 2>/dev/null || true
+          sudo apt-get autoremove -y
+          sudo apt-get clean
+          df -h /
+
+      - name: Check disk after cleanup
+        run: |
+          echo "=== Disk after cleanup ==="
+          df -h /
+          echo "=== Top 20 largest directories ==="
+          sudo du -h / --max-depth=2 2>/dev/null | sort -hr | head -20
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -qq -y --no-install-recommends \
+            git-core gnupg flex bison build-essential zip curl zlib1g-dev \
+            libc6-dev-i386 libncurses-dev x11proto-core-dev \
+            libx11-dev lib32z1-dev libgl1-mesa-dev libxml2-utils xsltproc unzip \
+            fontconfig python3 python3-pip python-is-python3 \
+            openjdk-21-jdk-headless rsync ccache pigz brotli \
+            lz4 libssl-dev bc cpio kmod
+          sudo apt-get clean
+          sudo rm -rf /var/lib/apt/lists/*
+
+      - name: Configure git
+        run: |
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
+          git config --global color.ui false
+
+      - name: Install repo tool
+        run: |
+          mkdir -p ~/bin
+          curl -s https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo
+          chmod +x ~/bin/repo
+          echo "~/bin" >> $GITHUB_PATH
+
+      - name: Initialize LineageOS 24 source & add manifest
+        run: |
+          set -e
+          mkdir -p ~/lineageOS24
+          cd ~/lineageOS24
+          echo "=== Initializing repo ==="
+          repo init -u https://github.com/LineageOS/android.git -b lineage-24.0 --git-lfs
+          echo "=== Repo init OK ==="
+          ls -la .repo/
+          
+          echo "=== Adding local manifest ==="
+          mkdir -p .repo/local_manifests
+          printf '<?xml version="1.0" encoding="UTF-8"?>\n<manifest>\n  <project name="LineageOS/android_device_samsung_gtowifi" path="device/samsung/gtowifi" remote="github" revision="lineage-22.2" />\n  <project name="LineageOS/android_kernel_samsung_sdm429" path="kernel/samsung/sdm429" remote="github" revision="lineage-22.2" />\n</manifest>\n' > .repo/local_manifests/gtowifi.xml
+          echo "=== Local manifest added ==="
+          cat .repo/local_manifests/gtowifi.xml
+          
+          echo "=== Verifying directory structure ==="
+          pwd
+          ls -la
+
+      - name: Sync source
+        run: |
+          cd ~/lineageOS24
+          echo "=== Syncing source ==="
+          repo sync -c --no-tags --no-clone-bundle -j$(nproc) --force-sync --optimized-fetch
+          echo "=== Sync complete ==="
+
+      - name: Download and extract vendor blobs
+        run: |
+          cd ~/lineageOS24
+          mkdir -p ~/blobs
+          wget -q -O ~/blobs/lineage-22.2-gtowifi.zip \
+            "https://mirrorbits.lineageos.org/full/gtowifi/2026/10/lineage-22.2-20261028-nightly-gtowifi-signed.zip" \
+            || wget -q -O ~/blobs/lineage-22.2-gtowifi.zip \
+            "https://download.lineageos.org/gtowifi/lineage-22.2-20261028-nightly-gtowifi-signed.zip"
+          echo "ce9b21ba3c8f4e5d6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f  ~/blobs/lineage-22.2-gtowifi.zip" | sha256sum -c -
+          cd device/samsung/gtowifi
+          ./extract-files.py ~/blobs/lineage-22.2-gtowifi.zip
+
+      - name: Apply fixes for Android 17
+        run: |
+          cd ~/lineageOS24
+
+          # 1. Fix target-level in device manifest (FCM 7 for Android 17)
+          sed -i 's/target-level="5"/target-level="7"/' device/samsung/gtowifi/manifest.xml
+
+          # 2. Remove disable_configstore from device.mk
+          sed -i '/disable_configstore/d' device/samsung/gtowifi/device.mk
+
+          # 3. Fix camera HAL displayservice
+          CAM=device/samsung/gtowifi/camera/QCamera2
+          sed -i 's|<android/frameworks/displayservice/|<lineage/frameworks/displayservice/|g' $CAM/util/QCameraDisplay.h
+          sed -i 's|android::frameworks::displayservice|lineage::frameworks::displayservice|g' $CAM/util/QCameraDisplay.h $CAM/util/QCameraDisplay.cpp
+          sed -i 's|android\.frameworks\.displayservice@1\.0|lineage.frameworks.displayservice@1\.0|g' $CAM/Android.mk
+
+          # 4. Kernel config: disable COMPAT_VDSO and MODULE_SIG
+          sed -i 's/CONFIG_COMPAT_VDSO=y/# CONFIG_COMPAT_VDSO is not set/' kernel/samsung/sdm429/arch/arm64/configs/lineageos_gtowifi_defconfig
+          sed -i 's/CONFIG_MODULE_SIG=y/# CONFIG_MODULE_SIG is not set/' kernel/samsung/sdm429/arch/arm64/configs/lineageos_gtowifi_defconfig
+          sed -i '/CONFIG_MODULE_SIG_FORCE/d' kernel/samsung/sdm429/arch/arm64/configs/lineageos_gtowifi_defconfig
+          sed -i '/CONFIG_MODULE_SIG_SHA512/d' kernel/samsung/sdm429/arch/arm64/configs/lineageos_gtowifi_defconfig
+
+          # 5. Use older clang for kernel 4.9 compatibility
+          echo '' >> device/samsung/gtowifi/BoardConfig.mk
+          echo '# Use older clang for 4.9 kernel compatibility' >> device/samsung/gtowifi/BoardConfig.mk
+          echo 'TARGET_KERNEL_CLANG_VERSION := r547379' >> device/samsung/gtowifi/BoardConfig.mk
+
+          echo "All fixes applied"
+
+      - name: Setup ccache
+        run: |
+          export USE_CCACHE=1
+          export CCACHE_EXEC=/usr/bin/ccache
+          ccache -M 50G
+          ccache -z
+
+      - name: Build
+        run: |
+          cd ~/lineageOS24
+          source build/envsetup.sh
+          export _JAVA_OPTIONS="-Xmx4g"
+          breakfast gtowifi
+          if [ "$CLEAN_BUILD" = "true" ]; then
+            mka clobber
+          fi
+          mka bacon -j$(nproc)
+
+      - name: Upload build artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lineage-24.0-gtowifi-${{ github.run_number }}
+          path: |
+            ~/lineageOS24/out/target/product/gtowifi/lineage-*.zip
+            ~/lineageOS24/out/target/product/gtowifi/lineage-*.zip.json
+          retention-days: 30
+
+      - name: Upload ccache
+        if: always()
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-lineageos-24-gtowifi-${{ github.run_number }}
+          restore-keys: |
+            ccache-lineageos-24-gtowifi-
+
+      - name: Build summary
+        if: always()
+        run: |
+          cd ~/lineageOS24
+          echo "## Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "- Device: gtowifi (SM-T290)" >> $GITHUB_STEP_SUMMARY
+          echo "- LineageOS: 24.0 (Android 17)" >> $GITHUB_STEP_SUMMARY
+          echo "- Variant: $BUILD_TYPE" >> $GITHUB_STEP_SUMMARY
+          echo "- Build time: $(date)" >> $GITHUB_STEP_SUMMARY
+          if [ -f out/target/product/gtowifi/lineage-*.zip ]; then
+            ls -lh out/target/product/gtowifi/lineage-*.zip >> $GITHUB_STEP_SUMMARY
+          else
+            echo "Build failed - no ZIP produced" >> $GITHUB_STEP_SUMMARY
+          fi
